@@ -64,9 +64,10 @@ def evaluate(facts):
     if _needs_wheel_warning(facts):
         notes.append(
             'ssh2-python==1.2.0.post1 publishes no cp315 wheel and no macOS x86_64 wheel. '
-            'Its macOS wheels are arm64, and only for CPython 3.11 and 3.12. '
-            'An Intel Mac on Python 3.15 has to compile the pinned sdist against libssh2. '
-            'That build is not verified here, and a Linux result is not a macOS result.'
+            'Its macOS wheels are arm64 only, for CPython 3.11 and 3.12. '
+            'The sdist vendors libssh2 1.11.1 and builds that copy with cmake; it does not need Homebrew. '
+            'A Linux CPython 3.15.0 build of this sdist imported successfully. That is not a macOS result. '
+            'Use install_ssh_only_venv.sh with the python.org 3.15 framework.'
         )
     specs = facts.get('specs') or {}
     missing = [name for name in REQUIRED if not specs.get(name)]

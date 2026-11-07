@@ -1,0 +1,8 @@
+# Build tools for the isolated venv. Installed before ssh2-python, never into the system Python.
+# cmake 4.4.4 publishes cmake-4.4.4-py3-none-macosx_10_10_universal2.whl.
+# That wheel runs on Intel x86_64. There is no separate macosx x86_64 cmake wheel, and none is required.
+# setuptools and wheel are py3-none-any. Do not install Cython; the sdist already contains the .c files.
+
+setuptools==84.2.1
+wheel==0.48.0
+cmake==4.4.4
