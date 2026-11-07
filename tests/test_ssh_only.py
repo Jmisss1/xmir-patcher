@@ -52,6 +52,7 @@ import connect7  # noqa: E402
 import gateway  # noqa: E402
 import preflight_ssh_only  # noqa: E402
 import ssh_only  # noqa: E402
+import ssh_only_build  # noqa: E402
 
 
 PASSWORD = 'TestOnly99'
@@ -515,6 +516,76 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn('BLOCKER', proc.stdout)
         self.assertNotIn('192.168.31.', proc.stdout)
+
+
+class OpenSSLPrefixTests(unittest.TestCase):
+    def test_missing_framework_headers_use_tool_prefix(self):
+        framework = "/Library/Frameworks/Python.framework/Versions/3.15"
+        prefix = ssh_only_build.choose_openssl_root("/tool", framework, headers_present = False)
+        self.assertEqual(prefix, "/tool/.ssh-only-dist/openssl-prefix")
+        self.assertNotIn("Python.framework", prefix)
+        still = ssh_only_build.choose_openssl_root("/tool", framework, headers_present = True)
+        self.assertEqual(still, prefix)
+
+    def test_framework_library_is_refused(self):
+        framework = "/Library/Frameworks/Python.framework/Versions/3.15"
+        prefix = "/tool/.ssh-only-dist/openssl-prefix"
+        dep = framework + "/lib/libcrypto.3.dylib"
+        with self.assertRaises(ssh_only_build.BuildPlanError):
+            ssh_only_build.classify_dependency(dep, [prefix], framework, {"libcrypto.3.dylib"})
+
+    def test_isolated_openssl_and_libssh2_are_rewritten(self):
+        framework = "/Library/Frameworks/Python.framework/Versions/3.15"
+        prefix = "/tool/.ssh-only-dist/openssl-prefix"
+        build_src = "/tool/.ssh-only-dist/src/ssh2_python-1.2.0.post1/build_dir/src"
+        names = {"libcrypto.3.dylib", "libssl.3.dylib", "libssh2.1.dylib"}
+        roots = [prefix, build_src]
+        crypto = ssh_only_build.classify_dependency(
+            prefix + "/lib/libcrypto.3.dylib", roots, framework, names)
+        sshlib = ssh_only_build.classify_dependency(
+            build_src + "/libssh2.1.dylib", roots, framework, names)
+        zlib = ssh_only_build.classify_dependency(
+            "/usr/lib/libz.1.dylib", roots, framework, names)
+        self.assertEqual(crypto, ("rewrite-loader", "libcrypto.3.dylib"))
+        self.assertEqual(sshlib, ("rewrite-loader", "libssh2.1.dylib"))
+        self.assertEqual(zlib, ("keep", "libz.1.dylib"))
+
+    def test_rpath_without_a_prefix_file_stops(self):
+        with self.assertRaises(ssh_only_build.BuildPlanError):
+            ssh_only_build.classify_dependency(
+                "@rpath/libcrypto.3.dylib",
+                ["/tool/.ssh-only-dist/openssl-prefix"],
+                "/Library/Frameworks/Python.framework/Versions/3.15",
+                set(),
+            )
+
+    def test_hash_mismatch_stops_offline(self):
+        import tempfile
+        handle = tempfile.NamedTemporaryFile(delete = False)
+        handle.write(b"not-the-tarball")
+        handle.close()
+        try:
+            with self.assertRaises(ssh_only_build.BuildPlanError):
+                ssh_only_build.verify_sha256(handle.name, ssh_only_build.OPENSSL_SHA256)
+        finally:
+            os.remove(handle.name)
+
+    def test_intel_mac_configure_target(self):
+        self.assertEqual(
+            ssh_only_build.configure_target("Darwin", "x86_64"),
+            "darwin64-x86_64-cc",
+        )
+
+    def test_installer_does_not_point_at_framework_openssl(self):
+        path = os.path.join(ROOT, "install_ssh_only_venv.sh")
+        with open(path, encoding = "utf-8") as handle:
+            text = handle.read()
+        self.assertNotIn('OPENSSL_ROOT_DIR="$FW"', text)
+        self.assertIn('OPENSSL_ROOT_DIR="$PREFIX"', text)
+        self.assertIn(ssh_only_build.OPENSSL_SHA256, text)
+        self.assertNotIn("OpenSSL headers are not in", text)
+        self.assertNotIn("python ssh_only.py", text)
+        self.assertNotIn("$ROOT/ssh_only.py", text)
 
 
 if __name__ == '__main__':

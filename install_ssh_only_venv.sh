@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Isolated dependency install for the SSH-only entry.
-# Downloads pinned artifacts, builds vendored libssh2 with the venv's cmake,
-# rewrites macOS library names with Command Line Tools, runs preflight, and stops.
-# It does not run ssh_only.py and does not contact a router.
+# Builds pinned OpenSSL 3.5.9 and vendored libssh2 inside this directory.
+# Does not use the Python.framework OpenSSL libraries or headers.
+# Does not run ssh_only.py and does not contact a router.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -10,6 +10,7 @@ PYTHON="${1:-/Library/Frameworks/Python.framework/Versions/3.15/bin/python3}"
 VENV="$ROOT/venv-ssh-only"
 CACHE="$ROOT/.ssh-only-dist"
 SRC="$CACHE/src"
+PREFIX="$CACHE/openssl-prefix"
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "BLOCKER: Python executable not found: $PYTHON" >&2
@@ -24,8 +25,8 @@ esac
 
 "$PYTHON" - << 'PY'
 import ssl, sys
-print(f"python={sys.version.split()[0]} exe={sys.executable}")
-print(f"ssl={ssl.OPENSSL_VERSION}")
+print("python=%s exe=%s" % (sys.version.split()[0], sys.executable))
+print("ssl=%s" % ssl.OPENSSL_VERSION)
 if sys.version_info[:2] != (3, 15):
     raise SystemExit("BLOCKER: this installer is for the measured CPython 3.15 framework, not another runtime.")
 if "LibreSSL" in ssl.OPENSSL_VERSION:
@@ -34,19 +35,19 @@ if "t" in getattr(sys, "abiflags", ""):
     raise SystemExit("BLOCKER: refusing a free-threaded build.")
 PY
 
-FW="$(cd "$(dirname "$PYTHON")/.." && pwd)"
-if [[ ! -f "$FW/include/openssl/ssl.h" || ! -f "$FW/include/openssl/crypto.h" ]]; then
-  echo "BLOCKER: OpenSSL headers are not in $FW/include/openssl." >&2
-  echo "The python.org framework is expected to ship them next to its libssl. This script does not install Homebrew." >&2
-  exit 1
-fi
-shopt -s nullglob
-ssl_libs=("$FW"/lib/libssl*.dylib)
-crypto_libs=("$FW"/lib/libcrypto*.dylib)
-shopt -u nullglob
-if [[ ${#ssl_libs[@]} -eq 0 || ${#crypto_libs[@]} -eq 0 ]]; then
-  echo "BLOCKER: libssl/libcrypto dylibs are not in $FW/lib." >&2
-  exit 1
+for tool in perl make clang; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "BLOCKER: $tool is not on PATH. Command Line Tools supply clang and make; macOS supplies perl. This installer does not use Homebrew." >&2
+    exit 1
+  fi
+done
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  for tool in otool install_name_tool; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "BLOCKER: $tool is not on PATH. It is part of the Command Line Tools." >&2
+      exit 1
+    fi
+  done
 fi
 
 if [[ -e "$VENV" ]]; then
@@ -54,22 +55,19 @@ if [[ -e "$VENV" ]]; then
   exit 1
 fi
 
-mkdir -p "$CACHE"
+mkdir -p "$CACHE" "$SRC"
 download() {
   local url="$1" name="$2" sha="$3" dest="$CACHE/$name"
   if [[ ! -f "$dest" ]]; then
     curl -fsSL "$url" -o "$dest"
   fi
-  "$PYTHON" - "$dest" "$sha" << 'PY'
-import hashlib, pathlib, sys
-path, expected = pathlib.Path(sys.argv[1]), sys.argv[2]
-got = hashlib.sha256(path.read_bytes()).hexdigest()
-if got != expected:
-    raise SystemExit(f"BLOCKER: hash mismatch for {path.name}: {got}")
-print(f"hash ok {path.name}")
-PY
+  PYTHONPATH="$ROOT" "$PYTHON" -c 'import sys; from ssh_only_build import verify_sha256; verify_sha256(sys.argv[1], sys.argv[2]); print("hash ok", sys.argv[1])' "$dest" "$sha"
 }
 
+download \
+  "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz" \
+  "openssl-3.5.9.tar.gz" \
+  "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
 download \
   "https://files.pythonhosted.org/packages/ef/55/6dc6d6bb953bdfc52519a0059592c52b6e3b8ad51cf8256dffceb55b0610/setuptools-84.2.1-py3-none-any.whl" \
   "setuptools-84.2.1-py3-none-any.whl" \
@@ -109,6 +107,25 @@ download \
   "idna-3.20-py3-none-any.whl" \
   "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c"
 
+FW="$(cd "$(dirname "$PYTHON")/.." && pwd)"
+TARGET="$(PYTHONPATH="$ROOT" "$PYTHON" -c 'import platform; from ssh_only_build import configure_target; print(configure_target(platform.system(), platform.machine()))')"
+PYTHONPATH="$ROOT" "$PYTHON" -c 'import sys; from ssh_only_build import choose_openssl_root; choose_openssl_root(sys.argv[1], sys.argv[2], False)' "$ROOT" "$FW"
+
+if [[ ! -f "$PREFIX/include/openssl/ssl.h" || ! -f "$PREFIX/include/openssl/crypto.h" ]]; then
+  rm -rf "$SRC/openssl-3.5.9" "$PREFIX"
+  tar -xzf "$CACHE/openssl-3.5.9.tar.gz" -C "$SRC"
+  (
+    cd "$SRC/openssl-3.5.9"
+    ./Configure "$TARGET" --prefix="$PREFIX" --libdir=lib --openssldir="$PREFIX/ssl" shared no-tests
+    make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+    make install_sw
+  )
+fi
+if [[ ! -f "$PREFIX/include/openssl/ssl.h" || ! -f "$PREFIX/include/openssl/crypto.h" ]]; then
+  echo "BLOCKER: the isolated OpenSSL prefix has no headers at $PREFIX/include/openssl." >&2
+  exit 1
+fi
+
 "$PYTHON" -m venv "$VENV"
 "$VENV/bin/python" -m pip install --no-index --find-links "$CACHE" \
   "setuptools==84.2.1" "wheel==0.48.0"
@@ -128,62 +145,19 @@ if "$VENV/bin/python" -c 'import Cython' >/dev/null 2>&1; then
   exit 1
 fi
 
-rm -rf "$SRC"
-mkdir -p "$SRC"
+rm -rf "$SRC/ssh2_python-1.2.0.post1"
 tar -xzf "$CACHE/ssh2_python-1.2.0.post1.tar.gz" -C "$SRC"
 export PATH="$VENV/bin:${PATH}"
-export OPENSSL_ROOT_DIR="$FW"
-export CMAKE_PREFIX_PATH="$FW"
+export OPENSSL_ROOT_DIR="$PREFIX"
+unset CMAKE_PREFIX_PATH || true
 (
   cd "$SRC/ssh2_python-1.2.0.post1"
   "$VENV/bin/python" -m pip install --no-build-isolation --no-deps .
 )
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  command -v otool >/dev/null
-  command -v install_name_tool >/dev/null
-  (
-    cd "$SRC/ssh2_python-1.2.0.post1"
-    "$VENV/bin/python" - "$FW" << 'PY'
-import glob, os, subprocess, sys, sysconfig
-framework = sys.argv[1]
-site = sysconfig.get_path("purelib")
-dylibs = [p for p in glob.glob("build_dir/src/libssh2*.dylib") if not p.endswith(".dSYM")]
-if not dylibs:
-    raise SystemExit("BLOCKER: cmake did not produce build_dir/src/libssh2*.dylib")
-src = dylibs[0]
-name = os.path.basename(src)
-dest_dir = os.path.join(site, "ssh2")
-dest = os.path.join(dest_dir, name)
-os.makedirs(dest_dir, exist_ok=True)
-subprocess.check_call(["cp", "-f", src, dest])
-subprocess.check_call(["install_name_tool", "-id", f"@loader_path/{name}", dest])
-
-def deps(path):
-    out = subprocess.check_output(["otool", "-L", path], text=True)
-    rows = []
-    for line in out.splitlines()[1:]:
-        rows.append(line.strip().split()[0])
-    return rows
-
-for dep in deps(dest):
-    base = os.path.basename(dep)
-    if base.startswith("libcrypto") or base.startswith("libssl"):
-        local = os.path.join(framework, "lib", base)
-        if dep.startswith("@rpath/") or not os.path.exists(dep):
-            if not os.path.exists(local):
-                raise SystemExit(f"BLOCKER: {dep} is not in the Python framework")
-            copied = os.path.join(dest_dir, base)
-            subprocess.check_call(["cp", "-f", local, copied])
-            subprocess.check_call(["install_name_tool", "-id", f"@loader_path/{base}", copied])
-            subprocess.check_call(["install_name_tool", "-change", dep, f"@loader_path/{base}", dest])
-for so in glob.glob(os.path.join(dest_dir, "*.so")):
-    for dep in deps(so):
-        if "libssh2" in os.path.basename(dep):
-            subprocess.check_call(["install_name_tool", "-change", dep, f"@loader_path/{name}", so])
-print("darwin library names rewritten")
-PY
-  )
+  PYTHONPATH="$ROOT" "$VENV/bin/python" -c 'import sys; from ssh_only_build import apply_darwin_fixup; apply_darwin_fixup(sys.argv[1], sys.argv[2], sys.argv[3])' \
+    "$PREFIX" "$FW" "$SRC/ssh2_python-1.2.0.post1/build_dir/src"
 fi
 
 "$VENV/bin/python" -m pip install --no-index --find-links "$CACHE" --no-deps \

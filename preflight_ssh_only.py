@@ -65,9 +65,10 @@ def evaluate(facts):
         notes.append(
             'ssh2-python==1.2.0.post1 publishes no cp315 wheel and no macOS x86_64 wheel. '
             'Its macOS wheels are arm64 only, for CPython 3.11 and 3.12. '
-            'The sdist vendors libssh2 1.11.1 and builds that copy with cmake; it does not need Homebrew. '
-            'A Linux CPython 3.15.0 build of this sdist imported successfully. That is not a macOS result. '
-            'Use install_ssh_only_venv.sh with the python.org 3.15 framework.'
+            'The sdist vendors libssh2 1.11.1 and builds that copy with cmake. '
+            'The python.org 3.15 framework has no OpenSSL headers, so install_ssh_only_venv.sh builds '
+            'OpenSSL 3.5.9 from the upstream tarball inside the tool directory and does not use the framework libraries. '
+            'A Linux build of that prefix linked libssh2. That is not a macOS result.'
         )
     specs = facts.get('specs') or {}
     missing = [name for name in REQUIRED if not specs.get(name)]
