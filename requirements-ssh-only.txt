@@ -1,0 +1,30 @@
+# Pinned dependencies for ssh_only.py only.
+# Do not use run.sh for this entry. run.sh installs the unpinned requirements.txt.
+# preflight_ssh_only.py does not install this file and does not contact a router.
+#
+# Inspected compatibility:
+# - urllib3==2.5.0 still has HTTPResponse._connection, which connect7.py reads.
+# - requests==2.34.2 accepts urllib3>=1.26,<3.
+#
+# ssh2-python==1.2.0.post1 wheel gap (PyPI file list for that release):
+# - no cp315 wheel
+# - no macosx x86_64 wheel
+# - macOS wheels are arm64 only, for cp311 and cp312
+# - manylinux and Windows wheels exist through cp314
+# Intel macOS + CPython 3.15 therefore has no published wheel. pip must compile
+# the pinned sdist and link libssh2. This tree does not verify that compile.
+# A passing test on Linux is not evidence that the Mac interpreter can import ssh2.
+#
+# Suggested later install, on the machine that will run the entry:
+#   python3 -m venv venv-ssh-only
+#   venv-ssh-only/bin/python -m pip install -r requirements-ssh-only.txt
+#   venv-ssh-only/bin/python preflight_ssh_only.py
+#   venv-ssh-only/bin/python ssh_only.py
+# Stop if the preflight prints BLOCKER. Do not point it at the router first.
+
+requests==2.34.2
+urllib3==2.5.0
+certifi==2026.10.23
+charset-normalizer==3.5.2
+idna==3.20
+ssh2-python==1.2.0.post1

@@ -284,9 +284,16 @@ class Gateway():
     dtype = 0 # 0: Web, 1: Android, 2: iOS, 3: Mac, 4: PC 
     device = self.mac_address
     nonce = "{}_{}_{}_{}".format(dtype, device, int(time.time()), random.randint(1000, 10000))
-    web_pass = self.webpassword
+    local_only = getattr(self, 'keep_secrets_local', False)
+    web_pass = getattr(self, '_secret_web', None) if local_only else None
+    if not web_pass and not local_only:
+      web_pass = self.webpassword
     if not web_pass:
-      web_pass = input("Enter device WEB password: ")
+      if local_only:
+        import getpass
+        web_pass = getpass.getpass("Enter device WEB password: ")
+      else:
+        web_pass = input("Enter device WEB password: ")
     account_str = (web_pass + self.nonce_key).encode('utf-8')
     account_str = self.xqhash(account_str)
     password = (nonce + account_str).encode('utf-8')
@@ -315,7 +322,7 @@ class Gateway():
         web_scheme = scheme
         break
     if not text:
-        self.webpassword = ""
+        self._forget_web_password(local_only)
         die(f"Cannot get response for api/xqsystem/login! (encryptmode = {self.encryptmode})")
     if web_scheme:
         if web_scheme == 'https' and self.web_scheme != web_scheme:
@@ -324,11 +331,19 @@ class Gateway():
     try:
         stok = re.findall(r'"token":"(.*?)"', text)[0]
     except Exception:
-        self.webpassword = ""
+        self._forget_web_password(local_only)
         die(f"WEB password is not correct! ERR={code} (encryptmode = {self.encryptmode})")
-    self.webpassword = web_pass
+    if local_only:
+        self._secret_web = web_pass
+    else:
+        self.webpassword = web_pass
     self.stok = stok
     return stok
+
+  def _forget_web_password(self, local_only):
+    self._secret_web = None
+    if not local_only:
+        self.webpassword = ""
 
   @property
   def apiurl(self):
@@ -598,6 +613,9 @@ class Gateway():
 
   @property
   def passw(self):
+    transient = getattr(self, '_secret_root', None)
+    if transient:
+      return transient
     return self.get_memcfg_param('passw', None)  # password for root user
 
   @passw.setter
@@ -651,6 +669,16 @@ class Gateway():
       json.dump(config, file, indent=4, sort_keys=True)
 
   #===============================================================================
+  def tcp_port_open(self, port, contimeout = 2):
+    sock = self.check_tcp_connect(self.ip_addr, port, contimeout = contimeout, retobj = True)
+    if not sock:
+      return False
+    try:
+      sock.close()
+    except Exception:
+      pass
+    return True
+
   def check_tcp_connect(self, ip, port, contimeout = 2, retobj = False):
     sock = None
     start_time = datetime.datetime.now()
@@ -1367,7 +1395,7 @@ def import_module(mod_name, gw):
         mod_object.inited_gw = gw
     mod_spec.loader.exec_module(mod_object)
 
-def create_gateway(timeout = 4, die_if_sshOk = True, die_if_ftpOk = True, web_login = True, ssh_port = 22, try_telnet = False):
+def create_gateway(timeout = 4, die_if_sshOk = True, die_if_ftpOk = True, web_login = True, ssh_port = 22, try_telnet = False, ssh_only = False):
     gw = Gateway(timeout = timeout, detect_ssh = False)
     if gw.status < 1:
         die(f"Xiaomi Mi Wi-Fi device not found (IP: {gw.ip_addr})")
@@ -1375,6 +1403,20 @@ def create_gateway(timeout = 4, die_if_sshOk = True, die_if_ftpOk = True, web_lo
     print(f"rom_version = {gw.rom_version} {gw.rom_channel}")
     print(f"mac_address = {gw.mac_address}")
     gw.ssh_port = ssh_port if ssh_port else 22
+    if ssh_only:
+        gw.ssh_only = True
+        gw.keep_secrets_local = True
+        if isinstance(web_login, str):
+            die(2, "Refusing a web password supplied by the caller.")
+        if gw.tcp_port_open(gw.ssh_port, contimeout = 2):
+            die(2, "SSH port is already open. Refusing to continue.")
+        if gw.tcp_port_open(23, contimeout = 2):
+            die(3, "Telnet port is already open. Refusing to continue.")
+        ccode = gw.device_info["countrycode"]
+        print(f'CountryCode = {ccode}')
+        if web_login:
+            gw.web_login()
+        return gw
     ret = gw.detect_ssh(verbose = 1, interactive = True)
     while ret == 23:
         ret = 0

