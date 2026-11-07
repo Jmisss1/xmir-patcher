@@ -1,4 +1,6 @@
 venv/
+venv-ssh-only/
+.ssh-only-dist/
 __pycache__/
 xmir_base/__pycache__/
 data/
